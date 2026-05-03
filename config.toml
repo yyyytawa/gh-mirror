@@ -1,0 +1,79 @@
+[server]
+tcp_address = ":443"
+unix_socket_path = "/var/run/github-proxy.sock"
+unix_socket_permission = 0660
+enable_tcp = true
+enable_unix_socket = false
+
+[tls]
+cert_file = "/etc/ssl/certs/your-domain.crt"
+key_file = "/etc/ssl/private/your-domain.key"
+
+# 域前置映射（目标主机 -> SNI 伪装域名）
+[tls.fronting_map]
+"github.com" = "www.cloudflare.com"
+"raw.githubusercontent.com" = "www.cloudflare.com"
+"avatars.githubusercontent.com" = "www.cloudflare.com"
+"gist.github.com" = "www.cloudflare.com"
+
+# 域前置时允许的证书 SAN（未配置则默认使用真实主机名）
+[tls.fronting_sans]
+"github.com" = ["github.com", "www.github.com"]
+"raw.githubusercontent.com" = ["github.com", "*.github.com"]
+"gist.github.com" = ["github.com", "*.github.com"]
+"avatars.githubusercontent.com" = ["github.com", "*.github.com"]
+"release-assets.githubusercontent.com" = ["github.com", "*.github.com"]
+"codeload.github.com" = ["github.com", "*.github.com"]
+
+[upstream.hosts]
+# 可以直接填写 IP 或者是优选的域名
+"github.com" = "your-cdn-ip-or-cname"
+"raw.githubusercontent.com" = "your-cdn-ip-or-cname"
+"gist.github.com" = "your-cdn-ip-or-cname"
+"avatars.githubusercontent.com" = "your-cdn-ip-or-cname"
+"release-assets.githubusercontent.com" = "your-cdn-ip-or-cname"
+"codeload.github.com" = "your-cdn-ip-or-cname"
+
+# 路径反代模式（统一入口）
+[path_proxy]
+enabled = true
+# 未匹配路径自动转发至 github.com
+[path_proxy.paths]
+"/raw/" = "raw.githubusercontent.com"
+"/gist/" = "gist.github.com"
+"/avatars/" = "avatars.githubusercontent.com"
+"/release-assets/" = "release-assets.githubusercontent.com"
+"/collect/" = "collect.githubusercontent.com"
+"/codeload/" = "codeload.github.com"
+
+[auth]
+enable_auth = true
+require_any = true
+
+[auth.ip_whitelist]
+enabled = false
+ips = ["10.0.0.0/8", "172.16.0.0/12"]
+trust_proxy_headers = true
+trusted_proxy_ips = ["127.0.0.1", "::1"]
+trusted_headers = ["X-Real-IP", "X-Forwarded-For"]
+
+[auth.cookie]
+# 访问 /<setup_path>?<setup_param>=<cookie_value> 添加验证 cookies
+enabled = true
+cookie_name = "proxy_auth_token"
+cookie_value = "your-secret-token-here"
+setup_path = "/auth"
+setup_param = "sk"
+
+[auth.mtls]
+enabled = false
+client_ca_file = "/etc/ssl/certs/client-ca.crt"
+verify_client_cert = false
+
+[auth.user_agent]
+# 白名单 UA
+enabled = false
+allowed_uas = ["curl/8.0.0"]
+
+[security]
+strip_auth_cookies = true

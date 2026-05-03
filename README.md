@@ -56,11 +56,11 @@ Type=simple
 WantedBy=multi-user.target
 ```
 
-重载配置: `sudo systemctl daemon-reload`
-启动服务: `sudo systemctl start github-proxy`
-停止服务: `sudo systemctl stop github-proxy`
-开机自启: `sudo systemctl enable github-proxy`
-取消自启: `sudo systemctl disable github-proxy`
+重载配置: `sudo systemctl daemon-reload`  
+启动服务: `sudo systemctl start github-proxy`  
+停止服务: `sudo systemctl stop github-proxy`  
+开机自启: `sudo systemctl enable github-proxy`  
+取消自启: `sudo systemctl disable github-proxy`  
 
 ### NSSM
 ~~官网: [nssm.cc]~~ 不知道为啥我这边打开 503.

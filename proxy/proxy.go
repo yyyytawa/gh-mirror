@@ -10,7 +10,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -25,16 +24,19 @@ type GitHubProxy struct {
 	transport    *http.Transport
 	authManager  *AuthManager
 	dialer       *net.Dialer
-	hostMap      map[string]string       // target host -> IP/CNAME
+	hostMap      map[string]string
 	pathProxy    *pathProxyConfig
-	frontingMap  map[string]string       // target host -> front SNI
-	frontingSANs map[string][]string     // target host -> allowed SANs
+	frontingMap  map[string]string
+	frontingSANs map[string][]string
+	replacements map[string]string
+	certReloader *CertReloader
+	fallbackHost string
 	mu           sync.RWMutex
 }
 
 type pathProxyConfig struct {
-	prefixTargets []prefixTarget         // sorted by prefix length desc
-	defaultHost   string                 // "github.com"
+	prefixTargets []prefixTarget
+	defaultHost   string
 }
 
 type prefixTarget struct {
@@ -43,8 +45,19 @@ type prefixTarget struct {
 }
 
 func NewGitHubProxy(config *Config) (*GitHubProxy, error) {
+	certReloader, err := NewCertReloader(config.TLS.CertFile, config.TLS.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("cert reloader: %w", err)
+	}
+	if config.Auth.MTLS.Enabled {
+		certReloader.SetClientCA(config.Auth.MTLS.ClientCAFile,
+			config.Auth.MTLS.VerifyClientCert,
+			config.Auth.MTLS.RequireOU)
+	}
+
 	p := &GitHubProxy{
-		config: config,
+		config:       config,
+		certReloader: certReloader,
 		dialer: &net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -52,8 +65,11 @@ func NewGitHubProxy(config *Config) (*GitHubProxy, error) {
 		hostMap:      config.Upstream.Hosts,
 		frontingMap:  config.TLS.FrontingMap,
 		frontingSANs: config.TLS.FrontingSANs,
+		replacements: config.Replacements,
+		fallbackHost: config.Server.FallbackHost,
 	}
 
+	// 路径代理初始化
 	pp := &pathProxyConfig{defaultHost: "github.com"}
 	type mapping struct {
 		prefix string
@@ -96,6 +112,7 @@ func (p *GitHubProxy) initTransport() error {
 	return nil
 }
 
+// dialTLSContext 域前置及证书 SAN 验证
 func (p *GitHubProxy) dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, _ := net.SplitHostPort(addr)
 	if port == "" {
@@ -194,6 +211,7 @@ func matchSAN(san, pattern string) bool {
 	return false
 }
 
+// ServeHTTP 主入口
 func (p *GitHubProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.handleCookieSetup(w, r) {
 		return
@@ -203,6 +221,11 @@ func (p *GitHubProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.stripAuthCookies(r)
+
+	host := r.Host
+	if host == "" {
+		host = p.fallbackHost
+	}
 
 	var targetHost string
 	var matchedPrefix string
@@ -223,7 +246,7 @@ func (p *GitHubProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	outReq := p.buildUpstreamRequest(r, targetHost)
-	p.proxyRequest(w, r, outReq)
+	p.proxyRequest(w, r, outReq, host)
 }
 
 func (p *GitHubProxy) handleCookieSetup(w http.ResponseWriter, r *http.Request) bool {
@@ -261,7 +284,7 @@ func (p *GitHubProxy) buildUpstreamRequest(r *http.Request, targetHost string) *
 	outReq.Header.Del("Proxy-Authenticate")
 	outReq.Header.Del("Proxy-Authorization")
 
-	// 强制所有请求使用 github.com 的 Origin 和 Referer（绕过子域 CSRF）
+	// 强制所有请求使用 github.com 的 Origin 和 Referer（确保 CSRF 通过）
 	outReq.Header.Set("Origin", "https://github.com")
 	outReq.Header.Set("Referer", "https://github.com/")
 
@@ -270,7 +293,7 @@ func (p *GitHubProxy) buildUpstreamRequest(r *http.Request, targetHost string) *
 	return outReq
 }
 
-func (p *GitHubProxy) proxyRequest(w http.ResponseWriter, r *http.Request, outReq *http.Request) {
+func (p *GitHubProxy) proxyRequest(w http.ResponseWriter, r *http.Request, outReq *http.Request, proxyHost string) {
 	resp, err := p.transport.RoundTrip(outReq)
 	if err != nil {
 		log.Printf("Proxy error: %v", err)
@@ -279,8 +302,7 @@ func (p *GitHubProxy) proxyRequest(w http.ResponseWriter, r *http.Request, outRe
 	}
 	defer resp.Body.Close()
 
-	proxyHost := r.Host
-
+	// 处理重定向
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			resp.Header.Set("Location", p.rewriteURL(loc, proxyHost))
@@ -291,8 +313,10 @@ func (p *GitHubProxy) proxyRequest(w http.ResponseWriter, r *http.Request, outRe
 		return
 	}
 
+	// Cookie 域重写
 	rewriteCookies(resp, proxyHost)
 
+	// 根据 Content-Type 决定是否修改主体
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	if !isTextContent(ct) {
 		copyHeaders(w.Header(), resp.Header)
@@ -326,38 +350,56 @@ func rewriteCookies(resp *http.Response, proxyHost string) {
 
 func (p *GitHubProxy) rewriteContent(body []byte, proxyHost string) []byte {
 	s := string(body)
+
+	// 默认替换 github.com 自身
 	s = strings.ReplaceAll(s, "https://github.com", "https://"+proxyHost)
 	s = strings.ReplaceAll(s, "http://github.com", "http://"+proxyHost)
+
+	// 自定义替换表
+	for oldDomain, target := range p.replacements {
+		oldURL := "https://" + oldDomain
+		var newURL string
+		switch {
+		case target == "host":
+			newURL = "https://" + proxyHost
+		case strings.HasPrefix(target, "/"):
+			newURL = "https://" + proxyHost + target
+		default:
+			newURL = "https://" + target
+		}
+		s = strings.ReplaceAll(s, oldURL, newURL)
+		s = strings.ReplaceAll(s, "http://"+oldDomain, newURL)
+	}
+
+	// 子域通配替换
 	re := regexp.MustCompile(`https://([a-zA-Z0-9-]+)\.github\.com`)
 	s = re.ReplaceAllString(s, "https://"+proxyHost+"/$1")
 
-	replacements := map[string]string{
-		"https://raw.githubusercontent.com":          "https://" + proxyHost + "/raw",
-		"https://gist.github.com":                    "https://" + proxyHost + "/gist",
-		"https://codeload.github.com":                "https://" + proxyHost + "/codeload",
-		"https://avatars.githubusercontent.com":       "https://" + proxyHost + "/avatars",
-		"https://release-assets.githubusercontent.com": "https://" + proxyHost + "/release-assets",
-	}
-	for old, new := range replacements {
-		s = strings.ReplaceAll(s, old, new)
-	}
 	return []byte(s)
 }
 
 func (p *GitHubProxy) rewriteURL(urlStr, proxyHost string) string {
-	rules := map[string]string{
-		"https://github.com":                              "https://" + proxyHost,
-		"https://raw.githubusercontent.com":               "https://" + proxyHost + "/raw",
-		"https://gist.github.com":                         "https://" + proxyHost + "/gist",
-		"https://codeload.github.com":                     "https://" + proxyHost + "/codeload",
-		"https://avatars.githubusercontent.com":            "https://" + proxyHost + "/avatars",
-		"https://release-assets.githubusercontent.com":     "https://" + proxyHost + "/release-assets",
-	}
-	for old, new := range rules {
-		if strings.HasPrefix(urlStr, old) {
-			return strings.Replace(urlStr, old, new, 1)
+	// 自定义替换表
+	for oldDomain, target := range p.replacements {
+		prefix := "https://" + oldDomain
+		if strings.HasPrefix(urlStr, prefix) {
+			switch {
+			case target == "host":
+				return "https://" + proxyHost + strings.TrimPrefix(urlStr, prefix)
+			case strings.HasPrefix(target, "/"):
+				return "https://" + proxyHost + target + strings.TrimPrefix(urlStr, prefix)
+			default:
+				return "https://" + target + strings.TrimPrefix(urlStr, prefix)
+			}
 		}
 	}
+
+	// 默认主站替换
+	if strings.HasPrefix(urlStr, "https://github.com") {
+		return strings.Replace(urlStr, "github.com", proxyHost, 1)
+	}
+
+	// 子域通配
 	re := regexp.MustCompile(`^https://([a-zA-Z0-9-]+)\.github\.com(.*)`)
 	if m := re.FindStringSubmatch(urlStr); len(m) == 3 {
 		return "https://" + proxyHost + "/" + m[1] + m[2]
@@ -411,31 +453,11 @@ func (p *GitHubProxy) stripAuthCookies(r *http.Request) {
 	}
 }
 
-func (p *GitHubProxy) GetTLSConfig() (*tls.Config, error) {
-	cfg := p.config
-	cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
-	if err != nil {
-		return nil, err
-	}
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
-	if cfg.Auth.MTLS.Enabled {
-		caCert, err := os.ReadFile(cfg.Auth.MTLS.ClientCAFile)
-		if err != nil {
-			return nil, err
-		}
-		caPool := x509.NewCertPool()
-		if !caPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("client CA parse error")
-		}
-		tlsCfg.ClientCAs = caPool
-		if cfg.Auth.MTLS.VerifyClientCert {
-			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-		} else {
-			tlsCfg.ClientAuth = tls.RequireAnyClientCert
-		}
-	}
-	return tlsCfg, nil
+// 证书热加载相关
+func (p *GitHubProxy) GetTLSConfig() *tls.Config {
+	return p.certReloader.GetServerTLSConfig()
+}
+
+func (p *GitHubProxy) ReloadCertificate() error {
+	return p.certReloader.load()
 }

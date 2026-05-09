@@ -1,20 +1,22 @@
 package proxy
 
 type Config struct {
-	Server    ServerConfig      `toml:"server"`
-	TLS       TLSConfig         `toml:"tls"`
-	Upstream  UpstreamConfig    `toml:"upstream"`
-	PathProxy PathProxyConfig   `toml:"path_proxy"`
-	Auth      AuthConfig        `toml:"auth"`
-	Security  SecurityConfig    `toml:"security"`
+	Server       ServerConfig            `toml:"server"`
+	TLS          TLSConfig               `toml:"tls"`
+	Upstream     UpstreamConfig          `toml:"upstream"`
+	PathProxy    PathProxyConfig         `toml:"path_proxy"`
+	Auth         AuthConfig              `toml:"auth"`
+	Security     SecurityConfig          `toml:"security"`
+	Replacements map[string]string       `toml:"replacements"`
 }
 
 type ServerConfig struct {
 	TCPAddress           string `toml:"tcp_address"`
 	UnixSocketPath       string `toml:"unix_socket_path"`
-	UnixSocketPermission uint32 `toml:"unix_socket_permission"`
+	UnixSocketPermission string `toml:"unix_socket_permission"` // 八进制字符串如 "0660"
 	EnableTCP            bool   `toml:"enable_tcp"`
 	EnableUnixSocket     bool   `toml:"enable_unix_socket"`
+	FallbackHost         string `toml:"fallback_host"`           // 当 Host 头缺失时使用
 }
 
 type TLSConfig struct {

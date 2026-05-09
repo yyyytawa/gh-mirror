@@ -33,16 +33,17 @@ func (am *AuthManager) CheckAuth(r *http.Request) bool {
 }
 
 func (am *AuthManager) checkAny(r *http.Request) bool {
-	checks := []func(*http.Request) bool{
-		am.checkIP,
-		am.checkCookie,
-		am.checkMTLS,
-		am.checkUserAgent,
+	if am.checkIP(r) {
+		return true
 	}
-	for _, check := range checks {
-		if check(r) {
-			return true
-		}
+	if am.checkCookie(r) {
+		return true
+	}
+	if am.checkMTLS(r) {
+		return true
+	}
+	if am.checkUserAgent(r) {
+		return true
 	}
 	return false
 }
@@ -155,16 +156,12 @@ func (am *AuthManager) checkMTLS(r *http.Request) bool {
 			return false
 		}
 		if cfg.RequireOU != "" {
-			found := false
 			for _, ou := range r.TLS.PeerCertificates[0].Subject.OrganizationalUnit {
 				if ou == cfg.RequireOU {
-					found = true
-					break
+					return true
 				}
 			}
-			if !found {
-				return false
-			}
+			return false
 		}
 	}
 	return true
@@ -177,6 +174,7 @@ func (am *AuthManager) checkUserAgent(r *http.Request) bool {
 	return am.uaChecker.IsAllowed(r.UserAgent())
 }
 
+// IP 白名单
 type IPChecker struct {
 	nets []*net.IPNet
 }
@@ -205,6 +203,7 @@ func (c *IPChecker) IsAllowed(ip string) bool {
 	return false
 }
 
+// User-Agent 白名单
 type UAChecker struct {
 	allowed map[string]bool
 }
